@@ -79,13 +79,139 @@ class ReliefApplicationTests(unittest.TestCase):
     def setUp(self):
         app.DATABASE = Path(self.tempdir.name) / f"{self._testMethodName}.db"
         app.initialize_database()
+        app.create_user("test-admin@example.com", "test-admin-password-12", "Administrator")
+        self.cookie = None
+        self.request("/api/auth/login", "POST", {
+            "email": "test-admin@example.com", "password": "test-admin-password-12",
+        })
 
     def request(self, path, method="GET", body=None):
-        data = json.dumps(body).encode() if body is not None else None
-        request = Request(self.base + path, data=data, method=method,
-                          headers={"Content-Type": "application/json"})
+        request = self.make_request(path, method, body)
         with urlopen(request) as response:
+            set_cookie = response.headers.get("Set-Cookie")
+            if set_cookie:
+                self.cookie = set_cookie.split(";", 1)[0]
             return response.status, json.loads(response.read())
+
+    def make_request(self, path, method="GET", body=None):
+        data = json.dumps(body).encode() if body is not None else None
+        headers = {"Content-Type": "application/json"}
+        if self.cookie:
+            headers["Cookie"] = self.cookie
+        return Request(self.base + path, data=data, method=method, headers=headers)
+
+    def test_authentication_and_database_role_permissions(self):
+        admin_cookie = self.cookie
+        status, user = self.request("/api/auth/me")
+        self.assertEqual(status, 200)
+        self.assertEqual(user["user"]["role"], "Administrator")
+
+        with app.connect() as db:
+            row = db.execute("SELECT password_hash FROM app_user WHERE username='test-admin@example.com'").fetchone()
+        self.assertNotIn("test-admin-password-12", row["password_hash"])
+        self.assertTrue(row["password_hash"].startswith("pbkdf2_sha256$"))
+
+        coordinator = self.request("/api/users", "POST", {
+            "email": "test-coordinator@example.com",
+            "password": "test-coordinator-password-12",
+            "role": "Coordinator",
+        })[1]
+        self.assertEqual(
+            self.request(f"/api/users/{coordinator['user_id']}/password", "PUT",
+                         {"password": "new-coordinator-password-12"})[0],
+            200,
+        )
+        self.cookie = None
+        with self.assertRaises(HTTPError) as error:
+            self.request("/api/dashboard")
+        self.assertEqual(error.exception.code, 401)
+        error.exception.close()
+
+        status, _ = self.request("/api/auth/login", "POST", {
+            "email": "test-coordinator@example.com", "password": "new-coordinator-password-12",
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(self.request("/api/auth/me")[1]["user"]["role"], "Coordinator")
+        self.assertEqual(self.request("/api/disasters")[0], 200)
+
+        with self.assertRaises(HTTPError) as error:
+            self.request("/api/users")
+        self.assertEqual(error.exception.code, 403)
+        error.exception.close()
+
+        first_disaster = self.request("/api/disasters")[1][0]
+        self.assertEqual(
+            self.request(f"/api/disasters/{first_disaster['disaster_id']}", "PUT",
+                         {"description": "Coordinator update"})[0],
+            200,
+        )
+        with self.assertRaises(HTTPError) as error:
+            self.request(f"/api/disasters/{first_disaster['disaster_id']}", "DELETE")
+        self.assertEqual(error.exception.code, 403)
+        error.exception.close()
+
+        self.cookie = admin_cookie
+        with self.assertRaises(HTTPError) as error:
+            self.request(f"/api/users/{user['user']['user_id']}/password", "PUT",
+                         {"password": "new-admin-password-12"})
+        self.assertEqual(error.exception.code, 400)
+        error.exception.close()
+
+        with self.assertRaises(HTTPError) as error:
+            self.request("/api/auth/login", "POST", {
+                "email": "test-coordinator@example.com", "password": "test-coordinator-password-12",
+            })
+        self.assertEqual(error.exception.code, 401)
+        error.exception.close()
+
+        with self.assertRaises(HTTPError) as error:
+            self.request("/api/auth/login", "POST", {
+                "email": "test-admin@example.com", "password": "wrong-password-000",
+            })
+        self.assertEqual(error.exception.code, 401)
+        error.exception.close()
+
+    def test_self_registration_bootstraps_admin_then_coordinator(self):
+        with app.connect() as db:
+            db.execute("DELETE FROM auth_session")
+            db.execute("DELETE FROM app_user")
+        status, first = self.request("/api/auth/register", "POST", {
+            "email": "First-Admin@Example.com", "password": "first-admin-password-12",
+        })
+        self.assertEqual(status, 201)
+        self.assertEqual(first["user"]["role"], "Administrator")
+        self.assertEqual(self.request("/api/auth/me")[1]["user"]["email"], "first-admin@example.com")
+
+        status, second = self.request("/api/auth/register", "POST", {
+            "email": "second-coordinator@example.com", "password": "second-coordinator-password-12",
+        })
+        self.assertEqual(status, 201)
+        self.assertEqual(second["user"]["role"], "Coordinator")
+        self.request("/api/auth/login", "POST", {
+            "email": "FIRST-ADMIN@EXAMPLE.COM", "password": "first-admin-password-12",
+        })
+        self.assertEqual(self.request("/api/users")[0], 200)
+
+        with self.assertRaises(HTTPError) as error:
+            self.request("/api/auth/register", "POST", {
+                "email": "first-admin@example.com", "password": "another-password-123",
+            })
+        self.assertEqual(error.exception.code, 409)
+        error.exception.close()
+
+        with self.assertRaises(HTTPError) as error:
+            self.request("/api/auth/register", "POST", {
+                "email": "not-an-email", "password": "long-enough-password-12",
+            })
+        self.assertEqual(error.exception.code, 400)
+        error.exception.close()
+
+        with self.assertRaises(HTTPError) as error:
+            self.request("/api/auth/register", "POST", {
+                "email": "short-password@example.com", "password": "short",
+            })
+        self.assertEqual(error.exception.code, 400)
+        error.exception.close()
 
     def test_schema_dashboard_and_static_frontend(self):
         status, dashboard = self.request("/api/dashboard")
@@ -165,9 +291,9 @@ class ReliefApplicationTests(unittest.TestCase):
         )
 
     def test_failed_parent_record_rolls_back_typed_link(self):
-        request = Request(self.base + "/api/affected_areas", data=json.dumps({
+        request = self.make_request("/api/affected_areas", "POST", {
             "disaster_id": "Must not persist", "area_name": "",
-        }).encode(), method="POST", headers={"Content-Type": "application/json"})
+        })
         with self.assertRaises(HTTPError) as error:
             urlopen(request)
         self.assertEqual(error.exception.code, 400)
@@ -206,20 +332,20 @@ class ReliefApplicationTests(unittest.TestCase):
             "quantity_distributed": 25,
         })
         self.assertEqual(self.request("/api/inventory")[1][0]["quantity_available"], inventory["quantity_available"] - 25)
-        request = Request(self.base + "/api/supply_distributions", data=json.dumps({
+        request = self.make_request("/api/supply_distributions", "POST", {
             "resource_id": resource["resource_id"], "to_area_id": area["area_id"],
             "quantity_distributed": 999999,
-        }).encode(), method="POST", headers={"Content-Type": "application/json"})
+        })
         with self.assertRaises(HTTPError) as error:
             urlopen(request)
         self.assertEqual(error.exception.code, 400)
         error.exception.close()
 
     def test_database_rejects_invalid_shelter_occupancy(self):
-        request = Request(self.base + "/api/shelters", data=json.dumps({
+        request = self.make_request("/api/shelters", "POST", {
             "shelter_name": "Invalid", "location": "Test", "capacity": 5,
             "current_occupancy": 6,
-        }).encode(), method="POST", headers={"Content-Type": "application/json"})
+        })
         with self.assertRaises(HTTPError) as error:
             urlopen(request)
         self.assertEqual(error.exception.code, 400)
@@ -282,10 +408,10 @@ class ReliefApplicationTests(unittest.TestCase):
             self.assertEqual(self.request(f"/api/field_reports/{report_id}", "DELETE")[0], 200)
             self.assertEqual(self.request("/api/field_reports")[1], [])
 
-            request = Request(self.base + "/api/field_reports", data=json.dumps({
+            request = self.make_request("/api/field_reports", "POST", {
                 "location": "Madikeri", "report_type": "Hazard",
                 "details": "Unsafe field key.", "extra_fields": {"$where": "bad"},
-            }).encode(), method="POST", headers={"Content-Type": "application/json"})
+            })
             with self.assertRaises(HTTPError) as error:
                 urlopen(request)
             self.assertEqual(error.exception.code, 400)

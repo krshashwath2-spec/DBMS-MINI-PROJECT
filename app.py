@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import base64
 import json
+import hashlib
+import hmac
 import math
 import mimetypes
+import os
 import re
+import secrets
 import sqlite3
+import sys
+from getpass import getpass
 from contextlib import contextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -55,6 +63,20 @@ ENTITIES = {
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
+CREATE TABLE IF NOT EXISTS app_user (
+ user_id INTEGER PRIMARY KEY AUTOINCREMENT,
+ username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+ password_hash TEXT NOT NULL,
+ role TEXT NOT NULL CHECK(role IN ('Administrator','Coordinator')),
+ is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
+ created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS auth_session (
+ token_hash TEXT PRIMARY KEY,
+ user_id INTEGER NOT NULL REFERENCES app_user(user_id) ON DELETE CASCADE,
+ expires_at TEXT NOT NULL,
+ created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 CREATE TABLE IF NOT EXISTS disaster (
  disaster_id INTEGER PRIMARY KEY AUTOINCREMENT,
  disaster_name TEXT NOT NULL, disaster_type TEXT NOT NULL DEFAULT 'Other',
@@ -249,6 +271,13 @@ CREATE TRIGGER IF NOT EXISTS distribution_decrements_inventory
  END;
 """
 
+PASSWORD_ITERATIONS = 310_000
+SESSION_HOURS = 8
+ROLE_NAMES = {"Administrator", "Coordinator"}
+EMAIL_PATTERN = re.compile(
+    r"^[^@\s]{1,64}@(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$"
+)
+
 REQUIRED = {
     "disasters": ("disaster_name",),
     "affected_areas": ("area_name", "location"),
@@ -314,6 +343,73 @@ def initialize_database() -> None:
     with connect() as db:
         db.executescript(SCHEMA)
         import_project_data(db)
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    derived = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PASSWORD_ITERATIONS)
+    return "pbkdf2_sha256${}${}${}".format(
+        PASSWORD_ITERATIONS,
+        base64.urlsafe_b64encode(salt).decode("ascii"),
+        base64.urlsafe_b64encode(derived).decode("ascii"),
+    )
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    try:
+        algorithm, iterations, salt_text, expected_text = stored_hash.split("$")
+        if algorithm != "pbkdf2_sha256":
+            return False
+        salt = base64.urlsafe_b64decode(salt_text)
+        expected = base64.urlsafe_b64decode(expected_text)
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, int(iterations))
+        return hmac.compare_digest(actual, expected)
+    except (ValueError, TypeError):
+        return False
+
+
+def validate_email(email: object) -> str:
+    if not isinstance(email, str):
+        raise APIError(400, "Enter a valid email address.")
+    normalized_email = email.strip().lower()
+    if len(normalized_email) > 254 or not EMAIL_PATTERN.fullmatch(normalized_email):
+        raise APIError(400, "Enter a valid email address, such as name@example.com.")
+    return normalized_email
+
+
+def validate_user_credentials(email: object, password: object, role: object) -> tuple[str, str, str]:
+    email = validate_email(email)
+    if not isinstance(password, str) or len(password) < 12 or len(password) > 256:
+        raise APIError(400, "Password must be between 12 and 256 characters.")
+    if not isinstance(role, str) or role not in ROLE_NAMES:
+        raise APIError(400, "Role must be Administrator or Coordinator.")
+    return email, password, role
+
+
+def create_user(email: str, password: str, role: str) -> int:
+    email, password, role = validate_user_credentials(email, password, role)
+    with connect() as db:
+        try:
+            cursor = db.execute(
+                "INSERT INTO app_user (username,password_hash,role) VALUES (?,?,?)",
+                (email, hash_password(password), role),
+            )
+        except sqlite3.IntegrityError:
+            raise APIError(409, "An account with that email already exists.") from None
+        return int(cursor.lastrowid)
+
+
+def reset_user_password(user_id: int, password: object) -> None:
+    if not isinstance(password, str) or len(password) < 12 or len(password) > 256:
+        raise APIError(400, "Password must be between 12 and 256 characters.")
+    with connect() as db:
+        cursor = db.execute(
+            "UPDATE app_user SET password_hash=? WHERE user_id=?",
+            (hash_password(password), user_id),
+        )
+        if cursor.rowcount == 0:
+            raise APIError(404, "User account not found.")
+        db.execute("DELETE FROM auth_session WHERE user_id=?", (user_id,))
 
 
 def mongo_field_reports():
@@ -496,12 +592,14 @@ class APIError(Exception):
 class ReliefHandler(BaseHTTPRequestHandler):
     server_version = "ReliefFlow/1.0"
 
-    def send_json(self, status: int, value: object) -> None:
+    def send_json(self, status: int, value: object, headers: dict[str, str] | None = None) -> None:
         body = json.dumps(value, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
+        for name, header_value in (headers or {}).items():
+            self.send_header(name, header_value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -517,7 +615,174 @@ class ReliefHandler(BaseHTTPRequestHandler):
             raise APIError(400, "Expected a JSON object.")
         return payload
 
+    @staticmethod
+    def public_user(row: sqlite3.Row) -> dict[str, object]:
+        return {
+            "user_id": row["user_id"],
+            "email": row["username"],
+            "role": row["role"],
+            "is_active": bool(row["is_active"]),
+            "created_at": row["created_at"],
+        }
+
+    def session_cookie(self, token: str, max_age: int) -> str:
+        secure = "; Secure" if os.environ.get("RELIEF_COOKIE_SECURE") == "1" else ""
+        return f"reliefflow_session={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{secure}"
+
+    def authenticate(self) -> dict[str, object] | None:
+        cookies = SimpleCookie()
+        try:
+            cookies.load(self.headers.get("Cookie", ""))
+        except CookieError:
+            return None
+        morsel = cookies.get("reliefflow_session")
+        if morsel is None:
+            return None
+        token_hash = hashlib.sha256(morsel.value.encode("ascii", "ignore")).hexdigest()
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with connect() as db:
+            row = db.execute(
+                """SELECT u.user_id,u.username,u.role,u.is_active,u.created_at
+                   FROM auth_session s JOIN app_user u ON u.user_id=s.user_id
+                   WHERE s.token_hash=? AND s.expires_at>?""",
+                (token_hash, now),
+            ).fetchone()
+        if row is None or not row["is_active"]:
+            return None
+        return self.public_user(row)
+
+    def require_user(self) -> dict[str, object]:
+        user = self.authenticate()
+        if user is None:
+            raise APIError(401, "Please sign in to continue.")
+        return user
+
+    def login(self) -> None:
+        payload = self.read_json()
+        email, password = payload.get("email"), payload.get("password")
+        if not isinstance(email, str) or not isinstance(password, str):
+            raise APIError(400, "Enter your email and password.")
+        email = validate_email(email)
+        with connect() as db:
+            row = db.execute("SELECT * FROM app_user WHERE username=? COLLATE NOCASE", (email,)).fetchone()
+            if row is None or not row["is_active"] or not verify_password(password, row["password_hash"]):
+                raise APIError(401, "Invalid email or password.")
+            token = secrets.token_urlsafe(32)
+            token_hash = hashlib.sha256(token.encode("ascii")).hexdigest()
+            expires_at = (datetime.now(timezone.utc) + timedelta(hours=SESSION_HOURS)).isoformat(timespec="seconds")
+            db.execute("DELETE FROM auth_session WHERE expires_at<=?",
+                       (datetime.now(timezone.utc).isoformat(timespec="seconds"),))
+            db.execute("INSERT INTO auth_session (token_hash,user_id,expires_at) VALUES (?,?,?)",
+                       (token_hash, row["user_id"], expires_at))
+            user = self.public_user(row)
+        self.send_json(200, {"user": user}, {"Set-Cookie": self.session_cookie(token, SESSION_HOURS * 3600)})
+
+    def register(self) -> None:
+        payload = self.read_json()
+        email, password = payload.get("email"), payload.get("password")
+        if not isinstance(email, str) or not isinstance(password, str):
+            raise APIError(400, "Enter an email address and password.")
+        email = validate_email(email)
+        token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(token.encode("ascii")).hexdigest()
+        expires_at = (datetime.now(timezone.utc) + timedelta(hours=SESSION_HOURS)).isoformat(timespec="seconds")
+        with connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            role = "Administrator" if db.execute("SELECT COUNT(*) FROM app_user").fetchone()[0] == 0 else "Coordinator"
+            email, password, role = validate_user_credentials(email, password, role)
+            try:
+                cursor = db.execute(
+                    "INSERT INTO app_user (username,password_hash,role) VALUES (?,?,?)",
+                    (email, hash_password(password), role),
+                )
+            except sqlite3.IntegrityError:
+                raise APIError(409, "An account with that email already exists.") from None
+            db.execute("INSERT INTO auth_session (token_hash,user_id,expires_at) VALUES (?,?,?)",
+                       (token_hash, cursor.lastrowid, expires_at))
+            user = db.execute(
+                "SELECT user_id,username,role,is_active,created_at FROM app_user WHERE user_id=?",
+                (cursor.lastrowid,),
+            ).fetchone()
+        self.send_json(201, {"user": self.public_user(user)},
+                       {"Set-Cookie": self.session_cookie(token, SESSION_HOURS * 3600)})
+
+    def logout(self) -> None:
+        user = self.require_user()
+        cookies = SimpleCookie()
+        try:
+            cookies.load(self.headers.get("Cookie", ""))
+        except CookieError:
+            cookies = SimpleCookie()
+        morsel = cookies.get("reliefflow_session")
+        if morsel is not None:
+            token_hash = hashlib.sha256(morsel.value.encode("ascii", "ignore")).hexdigest()
+            with connect() as db:
+                db.execute("DELETE FROM auth_session WHERE token_hash=?", (token_hash,))
+        self.send_json(200, {"message": "Signed out."},
+                       {"Set-Cookie": self.session_cookie("", 0)})
+
+    def handle_users(self, method: str, current_user: dict[str, object]) -> None:
+        match = re.fullmatch(r"/api/users(?:/(\d+)/password)?", urlparse(self.path).path)
+        if not match:
+            raise APIError(404, "User endpoint not found.")
+        password_user_id = match.group(1)
+        if password_user_id is not None:
+            if method != "PUT":
+                raise APIError(405, "Use PUT to reset a user's password.")
+            if int(password_user_id) == int(current_user["user_id"]):
+                raise APIError(400, "Use the local reset command to reset your own Administrator password.")
+            payload = self.read_json()
+            reset_user_password(int(password_user_id), payload.get("password"))
+            self.send_json(200, {"message": "Password reset. The user must sign in again."})
+            return
+        if method == "GET":
+            with connect() as db:
+                users = db.execute(
+                    "SELECT user_id,username,role,is_active,created_at FROM app_user ORDER BY username COLLATE NOCASE"
+                ).fetchall()
+            self.send_json(200, [self.public_user(row) for row in users])
+            return
+        if method != "POST":
+            raise APIError(405, "Only listing and creating users is supported.")
+        payload = self.read_json()
+        email, password, role = validate_user_credentials(
+            payload.get("email"), payload.get("password"), payload.get("role"))
+        with connect() as db:
+            try:
+                cursor = db.execute(
+                    "INSERT INTO app_user (username,password_hash,role) VALUES (?,?,?)",
+                    (email, hash_password(password), role),
+                )
+            except sqlite3.IntegrityError:
+                raise APIError(409, "An account with that email already exists.") from None
+            row = db.execute(
+                "SELECT user_id,username,role,is_active,created_at FROM app_user WHERE user_id=?",
+                (cursor.lastrowid,),
+            ).fetchone()
+        self.send_json(201, self.public_user(row))
+
     def handle_api(self, method: str, path: str) -> None:
+        if path == "/api/auth/login" and method == "POST":
+            self.login()
+            return
+        if path == "/api/auth/register" and method == "POST":
+            self.register()
+            return
+        if path == "/api/auth/logout" and method == "POST":
+            self.logout()
+            return
+        if path == "/api/auth/me" and method == "GET":
+            self.send_json(200, {"user": self.require_user()})
+            return
+
+        user = self.require_user()
+        if path == "/api/users" or path.startswith("/api/users/"):
+            if user["role"] != "Administrator":
+                raise APIError(403, "Administrator role required to manage users.")
+            self.handle_users(method, user)
+            return
+        if method == "DELETE" and user["role"] != "Administrator":
+            raise APIError(403, "Coordinator role cannot delete records.")
         if path == "/api/field_reports" or path.startswith("/api/field_reports/"):
             self.handle_field_reports(method, path)
             return
@@ -855,8 +1120,47 @@ class ReliefHandler(BaseHTTPRequestHandler):
         print(f"{self.address_string()} - {fmt % args}")
 
 
+def create_admin_interactive() -> None:
+    email = input("Administrator email address: ").strip()
+    password = getpass("Administrator password (minimum 12 characters): ")
+    confirmation = getpass("Confirm password: ")
+    if password != confirmation:
+        raise SystemExit("Passwords do not match.")
+    try:
+        user_id = create_user(email, password, "Administrator")
+    except APIError as exc:
+        raise SystemExit(str(exc)) from None
+    print(f"Administrator '{email}' created (user ID {user_id}).")
+
+
+def reset_password_interactive(email: str) -> None:
+    email = validate_email(email)
+    password = getpass(f"New password for '{email}' (minimum 12 characters): ")
+    confirmation = getpass("Confirm new password: ")
+    if password != confirmation:
+        raise SystemExit("Passwords do not match.")
+    with connect() as db:
+        row = db.execute("SELECT user_id FROM app_user WHERE username=? COLLATE NOCASE",
+                         (email,)).fetchone()
+    if row is None:
+        raise SystemExit(f"No account exists with email '{email}'.")
+    try:
+        reset_user_password(int(row["user_id"]), password)
+    except APIError as exc:
+        raise SystemExit(str(exc)) from None
+    print(f"Password reset for '{email}'. All existing sessions were signed out.")
+
+
 if __name__ == "__main__":
     initialize_database()
+    if sys.argv[1:] == ["--create-admin"]:
+        create_admin_interactive()
+        raise SystemExit(0)
+    if len(sys.argv) == 3 and sys.argv[1] == "--reset-password":
+        reset_password_interactive(sys.argv[2])
+        raise SystemExit(0)
+    if sys.argv[1:]:
+        raise SystemExit("Usage: py -3 app.py [--create-admin | --reset-password EMAIL]")
     print(f"ReliefFlow is running at http://localhost:{PORT}")
     try:
         ThreadingHTTPServer((HOST, PORT), ReliefHandler).serve_forever()
