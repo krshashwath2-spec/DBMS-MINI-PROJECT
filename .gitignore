@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+relief_management.db
+relief_management.db-shm
+relief_management.db-wal
