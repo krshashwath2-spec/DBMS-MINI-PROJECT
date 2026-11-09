@@ -420,7 +420,7 @@ class ReliefApplicationTests(unittest.TestCase):
     def test_mongodb_unavailable_returns_setup_error(self):
         with patch.object(app, "mongo_field_reports",
                           side_effect=ServerSelectionTimeoutError("MongoDB is not running")):
-            wiself.assertEqual(updated[\"extra_fields\"][\"roads_affected\"], [\"north\", \"east\"])th self.assertRaises(HTTPError) as error:
+            with self.assertRaises(HTTPError) as error:
                 self.request("/api/field_reports")
             self.assertEqual(error.exception.code, 503)
             self.assertEqual(json.loads(error.exception.read())["error"],
